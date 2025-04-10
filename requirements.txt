@@ -1,0 +1,8 @@
+functions-framework==3.*
+cloudevents==1.*
+google-cloud-tasks>=2.0.0
+google-cloud-documentai>=2.0.0
+google-cloud-bigquery>=3.0.0
+google-cloud-storage>=2.0.0
+google-generativeai>=0.3.0
+Flask>=2.0.0 # Required by HTTP functions framework 

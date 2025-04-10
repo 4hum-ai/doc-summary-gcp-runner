@@ -1,0 +1,371 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import os
+import json
+import sys
+import base64
+from collections.abc import Iterator
+from datetime import datetime
+import functions_framework
+from flask import Request, Response
+from google import genai
+from google.genai.types import GenerateContentConfig
+from google.api_core.client_options import ClientOptions
+from google.cloud import documentai
+from google.cloud import bigquery
+from google.cloud import storage
+
+@functions_framework.http
+def handle_task(request: Request) -> Response:
+    """HTTP Cloud Function triggered by Cloud Tasks to process a document.
+
+    Args:
+        request (flask.Request): The HTTP request object.
+            The body is expected to be a JSON payload from the webhook function.
+
+    Returns:
+        A Flask Response object.
+    """
+    event_id = "unknown"
+    try:
+        # --- Configuration --- Requires Environment Variables ---
+        project = os.environ["PROJECT_ID"]
+        location = os.environ["LOCATION"] # Location for Vertex AI
+        docai_processor_id = os.environ["DOCAI_PROCESSOR"]
+        docai_location = os.environ.get("DOCAI_LOCATION", "us")
+        output_bucket = os.environ["OUTPUT_BUCKET"] # For DocAI temp files
+        bq_dataset = os.environ["BQ_DATASET"]
+        bq_table = os.environ["BQ_TABLE"]
+        # --- End Configuration ---
+
+        if request.method != 'POST':
+            logging.warning("Received non-POST request.")
+            return Response("Method Not Allowed", status=405)
+
+        # --- Parse Payload --- #
+        raw_payload = request.get_data()
+        if not raw_payload:
+            logging.error("Received task with empty payload.")
+            return Response("Bad Request: Empty payload", status=200)
+
+        # Check if payload is base64 encoded
+        content_transfer_encoding = request.headers.get('Content-Transfer-Encoding')
+        print(f"Content-Transfer-Encoding: {content_transfer_encoding}")
+        print(f"raw_payload: {raw_payload}")
+        
+        # First try to parse as regular JSON
+        try:
+            payload = request.get_json(silent=True)
+            if payload:
+                print("Successfully parsed payload as regular JSON")
+                return process_request(payload)
+        except Exception as json_e:
+            logging.info(f"Could not parse as regular JSON: {json_e}")
+            # Continue to try base64 if that fails
+        
+        # If Content-Transfer-Encoding is base64, try to decode it
+        if content_transfer_encoding == 'base64':
+            try:
+                # The payload is already base64 encoded, just decode it directly
+                decoded_payload = base64.b64decode(raw_payload).decode('utf-8')
+                payload = json.loads(decoded_payload)
+                print(f"Successfully decoded base64 payload")
+                return process_request(payload)
+            except Exception as e:
+                logging.error(f"Failed to decode base64 payload: {e}")
+                return Response(f"Bad Request: Invalid payload - {str(e)}", status=200)
+        else:
+            # If we get here, we couldn't parse the payload at all
+            logging.error("Failed to parse payload in any format")
+            return Response("Bad Request: Invalid payload format", status=200)
+
+    except Exception as e:
+        logging.error(f"{event_id}: Error processing task: {str(e)}")
+        # Return 200 OK to prevent Cloud Tasks from retrying
+        return Response(f"Error: {str(e)}", status=200)
+
+def process_request(payload):
+    """Process the parsed payload and handle the request accordingly."""
+    event_id = payload.get("event_id", "N/A")
+    event_type = payload.get("event_type")
+    input_bucket = payload.get("bucket")
+    filename = payload.get("filename")
+
+    print(f"process_request: {payload}")
+
+    # --- Basic Validation --- #
+    if not all([event_type, input_bucket, filename]):
+        print(f"{event_id}: Task payload missing required fields (event_type, bucket, filename). Payload: {payload}")
+        return Response("Bad Request: Missing required fields", status=200)
+
+    # --- Route to appropriate handler --- #
+    if event_type == "google.cloud.storage.object.v1.finalized":
+        mime_type = payload.get("content_type")
+        time_created_str = payload.get("time_created")
+        if not mime_type or not time_created_str:
+            print(f"{event_id}: Task payload for finalized event missing content_type or time_created. Payload: {payload}")
+            return Response("Bad Request: Missing fields for finalized event", status=200)
+        
+        # Process the document
+        # This is where you would implement your document processing logic
+        # For now, we'll just log that we received the request
+        print(f"{event_id}: Processing document {filename} from bucket {input_bucket}")
+        process_document(
+            event_id=payload["event_id"],
+            input_bucket=payload["bucket"],
+            filename=payload["filename"],
+            mime_type=payload["content_type"],
+            time_uploaded=datetime.fromisoformat(payload["time_created"]),
+            project=os.environ["PROJECT_ID"],
+            location=os.environ["LOCATION"],
+            docai_processor_id=os.environ["DOCAI_PROCESSOR"],
+            docai_location=os.environ.get("DOCAI_LOCATION", "us"),
+            output_bucket=os.environ["OUTPUT_BUCKET"],
+            bq_dataset=os.environ["BQ_DATASET"],
+            bq_table=os.environ["BQ_TABLE"],
+        )
+        # Return success response
+        return Response("Document processing started", status=200)
+        
+    elif event_type == "google.cloud.storage.object.v1.deleted":
+        # Handle deletion event if needed
+        delete_document(
+            event_id=event_id,
+            input_bucket=input_bucket,
+            filename=filename,
+            project=os.environ["PROJECT_ID"],
+            bq_dataset=os.environ["BQ_DATASET"],
+            bq_table=os.environ["BQ_TABLE"],
+        )
+        print(f"{event_id}: Document {filename} was deleted from bucket {input_bucket}")
+        return Response("Document deletion acknowledged", status=200)
+        
+    else:
+        print(f"{event_id}: Unsupported event type: {event_type}")
+        return Response(f"Unsupported event type: {event_type}", status=200)
+
+# This is required for Cloud Functions (2nd gen) to listen on port 8080
+if __name__ == "__main__":
+    # Get port from environment variable or default to 8080
+    port = int(os.getenv("PORT", "8080"))
+    functions_framework.start(target="handle_task", port=port)
+
+# ================================================
+# Document Processing and Deletion Logic
+# ================================================
+
+def process_document(
+    event_id: str,
+    input_bucket: str,
+    filename: str,
+    mime_type: str,
+    time_uploaded: datetime,
+    project: str,
+    location: str,
+    docai_processor_id: str,
+    docai_location: str,
+    output_bucket: str,
+    bq_dataset: str,
+    bq_table: str,
+):
+    """Process a new document.
+
+    Args:
+        event_id: ID of the event.
+        input_bucket: Name of the input bucket.
+        filename: Name of the input file.
+        mime_type: MIME type of the input file.
+        time_uploaded: Time the input file was uploaded.
+        project: Google Cloud project ID.
+        location: Google Cloud location.
+        docai_processor_id: ID of the Document AI processor.
+        docai_location: Location of the Document AI processor.
+        output_bucket: Name of the output bucket.
+        bq_dataset: Name of the BigQuery dataset.
+        bq_table: Name of the BigQuery table.
+    """
+    doc_path = f"gs://{input_bucket}/{filename}"
+    print(f"📖 {event_id}: Getting document text")
+    doc_text = "\n".join(
+        get_document_text(
+            doc_path,
+            mime_type,
+            docai_processor_id,
+            output_bucket,
+            docai_location,
+        )
+    )
+
+    print(f"📝 {event_id}: Summarizing document")
+    print(f"  - Text length:    {len(doc_text)} characters")
+    client = genai.Client(vertexai=True, project=project, location=location)
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=doc_text,
+        config=GenerateContentConfig(
+            system_instruction=[
+                "Give me a summary of the following text."
+            ]
+        ),
+    )
+    doc_summary = response.text
+    print(doc_summary)
+    print(f"  - Summary length: {len(doc_summary)} characters")
+
+    print(f"🗃️ {event_id}: Writing document summary to BigQuery: {project}.{bq_dataset}.{bq_table}")
+    write_to_bigquery(
+        event_id=event_id,
+        time_uploaded=time_uploaded,
+        doc_path=doc_path,
+        doc_text=doc_text,
+        doc_summary=doc_summary,
+        project=project,
+        bq_dataset=bq_dataset,
+        bq_table=bq_table,
+    )
+
+    print(f"✅ {event_id}: Done!")
+
+
+def get_document_text(
+    input_file: str,
+    mime_type: str,
+    processor_id: str,
+    temp_bucket: str,
+    docai_location: str = "us",
+) -> Iterator[str]:
+    """Perform Optical Character Recognition (OCR) with Document AI on a Cloud Storage file.
+
+    For more information, see:
+        https://cloud.google.com/document-ai/docs/process-documents-ocr
+
+    Args:
+        input_file: GCS URI of the document file.
+        mime_type: MIME type of the document file.
+        processor_id: ID of the Document AI processor.
+        temp_bucket: GCS bucket to store Document AI temporary files.
+        docai_location: Location of the Document AI processor.
+
+    Yields: The document text chunks.
+    """
+    # You must set the `api_endpoint` if you use a location other than "us".
+    documentai_client = documentai.DocumentProcessorServiceClient(
+        client_options=ClientOptions(api_endpoint=f"{docai_location}-documentai.googleapis.com")
+    )
+
+    # We're using batch_process_documents instead of process_document because
+    # process_document has a quota limit of 15 pages per document, while
+    # batch_process_documents has a quota limit of 500 pages per request.
+    #   https://cloud.google.com/document-ai/quotas#general_processors
+    operation = documentai_client.batch_process_documents(
+        request=documentai.BatchProcessRequest(
+            name=processor_id,
+            input_documents=documentai.BatchDocumentsInputConfig(
+                gcs_documents=documentai.GcsDocuments(
+                    documents=[
+                        documentai.GcsDocument(gcs_uri=input_file, mime_type=mime_type),
+                    ],
+                ),
+            ),
+            document_output_config=documentai.DocumentOutputConfig(
+                gcs_output_config=documentai.DocumentOutputConfig.GcsOutputConfig(
+                    gcs_uri=f"gs://{temp_bucket}/ocr/{input_file.split('gs://')[-1]}",
+                ),
+            ),
+        ),
+    )
+    operation.result()
+
+    # Read the results of the Document AI operation from Cloud Storage.
+    storage_client = storage.Client()
+    metadata = documentai.BatchProcessMetadata(operation.metadata)
+    output_gcs_path = metadata.individual_process_statuses[0].output_gcs_destination
+    (output_bucket, output_prefix) = output_gcs_path.removeprefix("gs://").split("/", 1)
+    for blob in storage_client.list_blobs(output_bucket, prefix=output_prefix):
+        blob_contents = blob.download_as_bytes()
+        document = documentai.Document.from_json(blob_contents, ignore_unknown_fields=True)
+        yield document.text
+
+
+def write_to_bigquery(
+    event_id: str,
+    time_uploaded: datetime,
+    doc_path: str,
+    doc_text: str,
+    doc_summary: str,
+    project: str,
+    bq_dataset: str,
+    bq_table: str,
+) -> None:
+    """Write the summary to BigQuery.
+
+    Args:
+        event_id: The Eventarc trigger event ID.
+        time_uploaded: Time the document was uploaded.
+        doc_path: Cloud Storage path to the document.
+        doc_text: Text extracted from the document.
+        doc_summary: Summary generated fro the document.
+        project: Google Cloud project ID.
+        bq_dataset: Name of the BigQuery dataset.
+        bq_table: Name of the BigQuery table.
+    """
+    bq_client = bigquery.Client(project=project)
+    bq_client.insert_rows(
+        table=bq_client.get_table(f"{bq_dataset}.{bq_table}"),
+        rows=[
+            {
+                "event_id": event_id,
+                "time_uploaded": time_uploaded,
+                "time_processed": datetime.now(),
+                "document_path": doc_path,
+                "document_text": doc_text,
+                "document_summary": doc_summary,
+            },
+        ],
+    )
+
+def delete_document(
+    event_id: str,
+    input_bucket: str,
+    filename: str,
+    project: str,
+    bq_dataset: str,
+    bq_table: str,
+) -> None:
+    """Delete a document summary from BigQuery when the source document is deleted.
+
+    Args:
+        event_id: The Eventarc trigger event ID.
+        input_bucket: Name of the input bucket.
+        filename: Name of the input file.
+        project: Google Cloud project ID.
+        bq_dataset: Name of the BigQuery dataset.
+        bq_table: Name of the BigQuery table.
+    """
+    doc_path = f"gs://{input_bucket}/{filename}"
+    print(f"🗑️ {event_id}: Removing document summary from BigQuery: {project}.{bq_dataset}.{bq_table}")
+
+    bq_client = bigquery.Client(project=project)
+    query = f"""
+    DELETE FROM `{project}.{bq_dataset}.{bq_table}`
+    WHERE 'document_path' = '{doc_path}'
+    """
+    print(f"query: {query}")
+
+    query_job = bq_client.query(query)
+    query_job.result()  # Wait for the query to complete
+
+    print(f"✅ {event_id}: Document summary removal attempt finished for {doc_path}.")

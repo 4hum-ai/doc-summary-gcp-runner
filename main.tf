@@ -28,6 +28,7 @@ module "project_services" {
     "cloudbuild.googleapis.com",
     "cloudfunctions.googleapis.com",
     "cloudresourcemanager.googleapis.com",
+    "cloudtasks.googleapis.com",
     "compute.googleapis.com",
     "config.googleapis.com",
     "documentai.googleapis.com",
@@ -98,14 +99,16 @@ resource "google_cloudfunctions2_function" "webhook" {
     available_memory      = "1G"
     service_account_email = google_service_account.webhook.email
     environment_variables = {
-      PROJECT_ID       = module.project_services.project_id
-      LOCATION         = var.region
-      OUTPUT_BUCKET    = google_storage_bucket.main.name
-      DOCAI_PROCESSOR  = google_document_ai_processor.ocr.id
-      DOCAI_LOCATION   = google_document_ai_processor.ocr.location
-      BQ_DATASET       = google_bigquery_dataset.main.dataset_id
-      BQ_TABLE         = google_bigquery_table.main.table_id
-      LOG_EXECUTION_ID = true
+      PROJECT_ID            = module.project_services.project_id
+      LOCATION              = var.region
+      TASK_QUEUE_ID         = google_cloud_tasks_queue.task_queue.name
+      PROCESSOR_FUNCTION_URL = google_cloudfunctions2_function.processor.service_config[0].uri
+      OUTPUT_BUCKET         = google_storage_bucket.main.name
+      DOCAI_PROCESSOR       = google_document_ai_processor.ocr.id
+      DOCAI_LOCATION        = google_document_ai_processor.ocr.location
+      BQ_DATASET            = google_bigquery_dataset.main.dataset_id
+      BQ_TABLE              = google_bigquery_table.main.table_id
+      LOG_EXECUTION_ID      = true
     }
   }
 }
@@ -154,6 +157,12 @@ resource "google_storage_bucket_object" "webhook_staging" {
   source = data.archive_file.webhook_staging.output_path
 }
 
+# Add this resource after the Cloud Function definition
+resource "time_sleep" "wait_for_function" {
+  depends_on = [google_cloudfunctions2_function.webhook]
+  create_duration = "60s"
+}
+
 #-- Eventarc trigger --#
 resource "google_eventarc_trigger" "trigger" {
   project         = module.project_services.project_id
@@ -161,6 +170,10 @@ resource "google_eventarc_trigger" "trigger" {
   name            = local.trigger_name
   service_account = google_service_account.trigger.email
   labels          = var.labels
+
+  depends_on = [
+    time_sleep.wait_for_function
+  ]
 
   matching_criteria {
     attribute = "type"
@@ -186,6 +199,10 @@ resource "google_eventarc_trigger" "delete_trigger" {
   name            = "${local.trigger_name}-delete"
   service_account = google_service_account.trigger.email
   labels          = var.labels
+
+  depends_on = [
+    time_sleep.wait_for_function
+  ]
 
   matching_criteria {
     attribute = "type"
@@ -264,4 +281,108 @@ resource "google_bigquery_table" "main" {
   table_id            = "summaries"
   schema              = file("${path.module}/schema.json")
   deletion_protection = false
+}
+
+# Create a Cloud Tasks queue
+resource "google_cloud_tasks_queue" "task_queue" {
+  name     = "doc-processing-queue"
+  location = var.region
+  project  = module.project_services.project_id
+}
+
+# Create the processor function
+resource "google_cloudfunctions2_function" "processor" {
+  project  = module.project_services.project_id
+  name     = "doc-processor"
+  location = var.region
+  description = "Processes documents using Document AI and Gemini"
+  labels   = var.labels
+
+  build_config {
+    runtime     = "python312"
+    entry_point = "handle_task"
+    docker_repository = google_artifact_registry_repository.processor_images.id
+    source {
+      storage_source {
+        bucket = google_storage_bucket.main.name
+        object = google_storage_bucket_object.processor_staging.name
+      }
+    }
+  }
+
+  service_config {
+    max_instance_count = 1
+    available_memory   = "1G"
+    environment_variables = {
+      PROJECT_ID       = module.project_services.project_id
+      LOCATION         = var.region
+      DOCAI_PROCESSOR  = google_document_ai_processor.ocr.id
+      DOCAI_LOCATION   = google_document_ai_processor.ocr.location
+      OUTPUT_BUCKET    = google_storage_bucket.main.name
+      BQ_DATASET       = google_bigquery_dataset.main.dataset_id
+      BQ_TABLE         = google_bigquery_table.main.table_id
+    }
+  }
+}
+
+# Create Artifact Registry repository for processor function images
+resource "google_artifact_registry_repository" "processor_images" {
+  project       = module.project_services.project_id
+  location      = var.region
+  repository_id = "${local.artifact_repo_name}-processor"
+  format        = "DOCKER"
+  labels        = var.labels
+}
+
+# Package the processor function source code
+data "archive_file" "processor_staging" {
+  type        = "zip"
+  source_dir  = abspath("${path.module}/processor")
+  output_path = abspath("${path.module}/.tmp/processor.zip")
+  excludes = [
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "env",
+  ]
+}
+
+# Upload the processor function source code to Cloud Storage
+resource "google_storage_bucket_object" "processor_staging" {
+  name   = "processor-staging/${data.archive_file.processor_staging.output_base64sha256}.zip"
+  bucket = google_storage_bucket.main.name
+  source = data.archive_file.processor_staging.output_path
+}
+
+# Grant the webhook function permission to enqueue tasks
+resource "google_cloud_tasks_queue_iam_member" "webhook_enqueuer" {
+  project  = module.project_services.project_id
+  location = var.region
+  name     = google_cloud_tasks_queue.task_queue.name
+  role     = "roles/cloudtasks.enqueuer"
+  member   = "serviceAccount:${google_service_account.webhook.email}"
+}
+
+# Grant Cloud Tasks permission to invoke the processor function
+resource "google_cloud_run_service_iam_member" "tasks_invoker" {
+  project  = module.project_services.project_id
+  location = var.region
+  service  = google_cloudfunctions2_function.processor.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-cloudtasks.iam.gserviceaccount.com"
+}
+
+# Allow unauthenticated access to the Cloud Run service
+resource "google_cloud_run_service_iam_member" "public_access" {
+  project  = module.project_services.project_id
+  location = var.region
+  service  = google_cloudfunctions2_function.processor.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+# Add data source for project number (needed for Cloud Tasks service agent)
+data "google_project" "project" {
+  project_id = module.project_services.project_id
 }
