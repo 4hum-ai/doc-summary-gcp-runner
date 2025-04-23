@@ -46,16 +46,17 @@ resource "random_id" "unique_id" {
 }
 
 locals {
-  bucket_main_name   = var.unique_names ? "summary-main-${var.project_id}-${random_id.unique_id.hex}" : "summary-main-${var.project_id}"
-  bucket_docs_name   = var.unique_names ? "summary-docs-${var.project_id}-${random_id.unique_id.hex}" : "summary-docs-${var.project_id}"
-  webhook_name       = var.unique_names ? "summary-webhook-${random_id.unique_id.hex}" : "summary-webhook"
-  webhook_sa_name    = var.unique_names ? "summary-webhook-sa-${random_id.unique_id.hex}" : "summary-webhook-sa"
-  artifact_repo_name = var.unique_names ? "summary-artifact-repo-${random_id.unique_id.hex}" : "summary-artifact-repo"
-  trigger_name       = var.unique_names ? "summary-trigger-${random_id.unique_id.hex}" : "summary-trigger"
-  trigger_sa_name    = var.unique_names ? "summary-trigger-sa-${random_id.unique_id.hex}" : "summary-trigger-sa"
-  ocr_processor_name = var.unique_names ? "summary-ocr-processor-${random_id.unique_id.hex}" : "summary-ocr-processor"
-  bq_dataset_name    = var.unique_names ? "summary_dataset_${random_id.unique_id.hex}" : "summary_dataset"
+  bucket_main_name   = var.unique_names ? "main-${var.project_id}-${random_id.unique_id.hex}" : "main-${var.project_id}"
+  bucket_docs_name   = var.unique_names ? "docs-${var.project_id}-${random_id.unique_id.hex}" : "docs-${var.project_id}"
+  webhook_name       = var.unique_names ? "webhook-${random_id.unique_id.hex}" : "webhook"
+  webhook_sa_name    = var.unique_names ? "webhook-sa-${random_id.unique_id.hex}" : "webhook-sa"
+  artifact_repo_name = var.unique_names ? "artifact-repo-${random_id.unique_id.hex}" : "artifact-repo"
+  trigger_name       = var.unique_names ? "trigger-${random_id.unique_id.hex}" : "trigger"
+  trigger_sa_name    = var.unique_names ? "trigger-sa-${random_id.unique_id.hex}" : "trigger-sa"
+  ocr_processor_name = var.unique_names ? "ocr-processor-${random_id.unique_id.hex}" : "ocr-processor"
+  bq_dataset_name    = var.unique_names ? "dms_${random_id.unique_id.hex}" : "dms"
 }
+
 
 #-- Cloud Storage buckets --#
 resource "google_storage_bucket" "main" {
@@ -278,7 +279,7 @@ resource "google_bigquery_dataset" "main" {
 resource "google_bigquery_table" "main" {
   project             = module.project_services.project_id
   dataset_id          = google_bigquery_dataset.main.dataset_id
-  table_id            = "summaries"
+  table_id            = "documents"
   schema              = file("${path.module}/schema.json")
   deletion_protection = false
 }

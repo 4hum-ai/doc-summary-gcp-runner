@@ -27,6 +27,7 @@ from google.api_core.client_options import ClientOptions
 from google.cloud import documentai
 from google.cloud import bigquery
 from google.cloud import storage
+import urllib.parse
 
 @functions_framework.http
 def handle_task(request: Request) -> Response:
@@ -103,6 +104,7 @@ def process_request(payload):
     event_type = payload.get("event_type")
     input_bucket = payload.get("bucket")
     filename = payload.get("filename")
+    uploader = payload.get("uploader", "unknown")  # Get uploader from payload
 
     print(f"process_request: {payload}")
 
@@ -120,8 +122,6 @@ def process_request(payload):
             return Response("Bad Request: Missing fields for finalized event", status=200)
         
         # Process the document
-        # This is where you would implement your document processing logic
-        # For now, we'll just log that we received the request
         print(f"{event_id}: Processing document {filename} from bucket {input_bucket}")
         process_document(
             event_id=payload["event_id"],
@@ -129,6 +129,7 @@ def process_request(payload):
             filename=payload["filename"],
             mime_type=payload["content_type"],
             time_uploaded=datetime.fromisoformat(payload["time_created"]),
+            uploader=uploader,  # Pass uploader to process_document
             project=os.environ["PROJECT_ID"],
             location=os.environ["LOCATION"],
             docai_processor_id=os.environ["DOCAI_PROCESSOR"],
@@ -173,6 +174,7 @@ def process_document(
     filename: str,
     mime_type: str,
     time_uploaded: datetime,
+    uploader: str,
     project: str,
     location: str,
     docai_processor_id: str,
@@ -189,6 +191,7 @@ def process_document(
         filename: Name of the input file.
         mime_type: MIME type of the input file.
         time_uploaded: Time the input file was uploaded.
+        uploader: Identity of the user who uploaded the file.
         project: Google Cloud project ID.
         location: Google Cloud location.
         docai_processor_id: ID of the Document AI processor.
@@ -198,7 +201,22 @@ def process_document(
         bq_table: Name of the BigQuery table.
     """
     doc_path = f"gs://{input_bucket}/{filename}"
+    auth_url = f"https://storage.cloud.google.com/{urllib.parse.quote(input_bucket)}/{urllib.parse.quote(filename)}"
+    
+    # Parse folder structure
+    path_parts = filename.split('/')
+    file_name = path_parts[-1]  # Last part is the file name
+    parent_folders = path_parts[:-1]  # All parts except the last are parent folders
+    
+    # Get file size from GCS
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(input_bucket)
+    blob = bucket.blob(filename)
+    file_size = blob.size  # Size in bytes
+    
     print(f"📖 {event_id}: Getting document text")
+    print(f"  - Folder path:    {'/'.join(parent_folders)}")
+    print(f"  - File name:      {file_name}")
     doc_text = "\n".join(
         get_document_text(
             doc_path,
@@ -208,30 +226,38 @@ def process_document(
             docai_location,
         )
     )
+    text_length = len(doc_text)  # Text length in characters
 
     print(f"📝 {event_id}: Summarizing document")
-    print(f"  - Text length:    {len(doc_text)} characters")
+    print(f"  - File size:      {file_size} bytes")
+    print(f"  - Text length:    {text_length} characters")
     client = genai.Client(vertexai=True, project=project, location=location)
     response = client.models.generate_content(
         model="gemini-2.0-flash",
         contents=doc_text,
         config=GenerateContentConfig(
             system_instruction=[
-                "Give me a summary of the following text."
+                "Generate abstract, in the same language"
             ]
         ),
     )
-    doc_summary = response.text
-    print(doc_summary)
-    print(f"  - Summary length: {len(doc_summary)} characters")
+    doc_abstract = response.text
+    print(doc_abstract)
+    print(f"  - Summary length: {len(doc_abstract)} characters")
 
     print(f"🗃️ {event_id}: Writing document summary to BigQuery: {project}.{bq_dataset}.{bq_table}")
     write_to_bigquery(
         event_id=event_id,
         time_uploaded=time_uploaded,
         doc_path=doc_path,
+        auth_url=auth_url,
         doc_text=doc_text,
-        doc_summary=doc_summary,
+        doc_abstract=doc_abstract,
+        uploader=uploader,
+        file_size=file_size,
+        text_length=text_length,
+        parent_folders=parent_folders,
+        file_name=file_name,
         project=project,
         bq_dataset=bq_dataset,
         bq_table=bq_table,
@@ -304,8 +330,14 @@ def write_to_bigquery(
     event_id: str,
     time_uploaded: datetime,
     doc_path: str,
+    auth_url: str,
     doc_text: str,
-    doc_summary: str,
+    doc_abstract: str,
+    uploader: str,
+    file_size: int,
+    text_length: int,
+    parent_folders: list[str],
+    file_name: str,
     project: str,
     bq_dataset: str,
     bq_table: str,
@@ -316,8 +348,14 @@ def write_to_bigquery(
         event_id: The Eventarc trigger event ID.
         time_uploaded: Time the document was uploaded.
         doc_path: Cloud Storage path to the document.
+        auth_url: Authentication URL for accessing the document.
         doc_text: Text extracted from the document.
-        doc_summary: Summary generated fro the document.
+        doc_abstract: Summary generated fro the document.
+        uploader: Identity of the user who uploaded the file.
+        file_size: Size of the original file in bytes.
+        text_length: Length of the extracted text in characters.
+        parent_folders: List of parent folder names in the path.
+        file_name: Name of the file without the path.
         project: Google Cloud project ID.
         bq_dataset: Name of the BigQuery dataset.
         bq_table: Name of the BigQuery table.
@@ -331,8 +369,14 @@ def write_to_bigquery(
                 "time_uploaded": time_uploaded,
                 "time_processed": datetime.now(),
                 "document_path": doc_path,
+                "auth_url": auth_url,
                 "document_text": doc_text,
-                "document_summary": doc_summary,
+                "document_abstract": doc_abstract,
+                "uploader": uploader,
+                "file_size_bytes": file_size,
+                "text_length_chars": text_length,
+                "parent_folders": parent_folders,
+                "file_name": file_name,
             },
         ],
     )

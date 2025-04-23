@@ -20,13 +20,44 @@
     "description": "Cloud Storage path to the document"
   },
   {
+    "name": "auth_url",
+    "type": "STRING",
+    "description": "Authentication URL for accessing the document"
+  },
+  {
     "name": "document_text",
     "type": "STRING",
     "description": "Text extracted from the document"
   },
   {
-    "name": "document_summary",
+    "name": "document_abstract",
     "type": "STRING",
-    "description": "Summary generated fro the document"
+    "description": "Abstract generated from the document"
+  },
+  {
+    "name": "uploader",
+    "type": "STRING",
+    "description": "Email address of the user or service account that uploaded the document"
+  },
+  {
+    "name": "file_size_bytes",
+    "type": "INTEGER",
+    "description": "Size of the original file in bytes"
+  },
+  {
+    "name": "text_length_chars",
+    "type": "INTEGER",
+    "description": "Length of the extracted text in characters"
+  },
+  {
+    "name": "parent_folders",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Array of parent folder names in the path, ordered from top to bottom"
+  },
+  {
+    "name": "file_name",
+    "type": "STRING",
+    "description": "Name of the file without the path"
   }
 ]
