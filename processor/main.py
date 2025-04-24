@@ -28,6 +28,7 @@ from google.cloud import documentai
 from google.cloud import bigquery
 from google.cloud import storage
 import urllib.parse
+from . import delete_document
 
 @functions_framework.http
 def handle_task(request: Request) -> Response:
@@ -44,10 +45,9 @@ def handle_task(request: Request) -> Response:
     try:
         # --- Configuration --- Requires Environment Variables ---
         project = os.environ["PROJECT_ID"]
-        location = os.environ["LOCATION"] # Location for Vertex AI
         docai_processor_id = os.environ["DOCAI_PROCESSOR"]
         docai_location = os.environ.get("DOCAI_LOCATION", "us")
-        output_bucket = os.environ["OUTPUT_BUCKET"] # For DocAI temp files
+        output_bucket = os.environ["OUTPUT_BUCKET"] 
         bq_dataset = os.environ["BQ_DATASET"]
         bq_table = os.environ["BQ_TABLE"]
         # --- End Configuration ---
@@ -55,48 +55,17 @@ def handle_task(request: Request) -> Response:
         if request.method != 'POST':
             logging.warning("Received non-POST request.")
             return Response("Method Not Allowed", status=405)
-
-        # --- Parse Payload --- #
-        raw_payload = request.get_data()
-        if not raw_payload:
-            logging.error("Received task with empty payload.")
-            return Response("Bad Request: Empty payload", status=200)
-
-        # Check if payload is base64 encoded
-        content_transfer_encoding = request.headers.get('Content-Transfer-Encoding')
-        print(f"Content-Transfer-Encoding: {content_transfer_encoding}")
-        print(f"raw_payload: {raw_payload}")
         
-        # First try to parse as regular JSON
-        try:
-            payload = request.get_json(silent=True)
-            if payload:
-                print("Successfully parsed payload as regular JSON")
-                return process_request(payload)
-        except Exception as json_e:
-            logging.info(f"Could not parse as regular JSON: {json_e}")
-            # Continue to try base64 if that fails
-        
-        # If Content-Transfer-Encoding is base64, try to decode it
-        if content_transfer_encoding == 'base64':
-            try:
-                # The payload is already base64 encoded, just decode it directly
-                decoded_payload = base64.b64decode(raw_payload).decode('utf-8')
-                payload = json.loads(decoded_payload)
-                print(f"Successfully decoded base64 payload")
-                return process_request(payload)
-            except Exception as e:
-                logging.error(f"Failed to decode base64 payload: {e}")
-                return Response(f"Bad Request: Invalid payload - {str(e)}", status=200)
-        else:
-            # If we get here, we couldn't parse the payload at all
-            logging.error("Failed to parse payload in any format")
-            return Response("Bad Request: Invalid payload format", status=200)
+        payload = request.get_json(silent=True)
+        if not payload:
+            logging.error("Missing JSON Payload")
+            return Response("Bad Request: Missing JSON Payload", status=200)      
+
+        return process_request(payload)
 
     except Exception as e:
         logging.error(f"{event_id}: Error processing task: {str(e)}")
-        # Return 200 OK to prevent Cloud Tasks from retrying
-        return Response(f"Error: {str(e)}", status=200)
+        return Response(f"Error: {str(e)}", status=200)  # Return 200 OK to prevent Cloud Tasks from retrying
 
 def process_request(payload):
     """Process the parsed payload and handle the request accordingly."""
@@ -106,7 +75,7 @@ def process_request(payload):
     filename = payload.get("filename")
     uploader = payload.get("uploader", "unknown")  # Get uploader from payload
 
-    print(f"process_request: {payload}")
+    print(f"🔲process_request: {payload}")
 
     # --- Basic Validation --- #
     if not all([event_type, input_bucket, filename]):
@@ -120,9 +89,7 @@ def process_request(payload):
         if not mime_type or not time_created_str:
             print(f"{event_id}: Task payload for finalized event missing content_type or time_created. Payload: {payload}")
             return Response("Bad Request: Missing fields for finalized event", status=200)
-        
         # Process the document
-        print(f"{event_id}: Processing document {filename} from bucket {input_bucket}")
         process_document(
             event_id=payload["event_id"],
             input_bucket=payload["bucket"],
@@ -151,7 +118,6 @@ def process_request(payload):
             bq_dataset=os.environ["BQ_DATASET"],
             bq_table=os.environ["BQ_TABLE"],
         )
-        print(f"{event_id}: Document {filename} was deleted from bucket {input_bucket}")
         return Response("Document deletion acknowledged", status=200)
         
     else:
@@ -214,7 +180,7 @@ def process_document(
     blob = bucket.blob(filename)
     file_size = blob.size  # Size in bytes
     
-    print(f"📖 {event_id}: Getting document text")
+    print(f"(1/3) Getting document text")
     print(f"  - Folder path:    {'/'.join(parent_folders)}")
     print(f"  - File name:      {file_name}")
     doc_text = "\n".join(
@@ -228,7 +194,7 @@ def process_document(
     )
     text_length = len(doc_text)  # Text length in characters
 
-    print(f"📝 {event_id}: Summarizing document")
+    print(f"(2/3): Summarizing document")
     print(f"  - File size:      {file_size} bytes")
     print(f"  - Text length:    {text_length} characters")
     client = genai.Client(vertexai=True, project=project, location=location)
@@ -237,15 +203,15 @@ def process_document(
         contents=doc_text,
         config=GenerateContentConfig(
             system_instruction=[
-                "Generate abstract, in the same language"
+                "Generate abstract, in the same language. Just return the abstract and nothing more."
             ]
         ),
     )
     doc_abstract = response.text
-    print(doc_abstract)
+
     print(f"  - Summary length: {len(doc_abstract)} characters")
 
-    print(f"🗃️ {event_id}: Writing document summary to BigQuery: {project}.{bq_dataset}.{bq_table}")
+    print(f"(3/3) Writing document to BigQuery: {project}.{bq_dataset}.{bq_table}")
     write_to_bigquery(
         event_id=event_id,
         time_uploaded=time_uploaded,
@@ -263,7 +229,7 @@ def process_document(
         bq_table=bq_table,
     )
 
-    print(f"✅ {event_id}: Done!")
+    print(f"✅ Completed: {event_id}")
 
 
 def get_document_text(
@@ -361,6 +327,8 @@ def write_to_bigquery(
         bq_table: Name of the BigQuery table.
     """
     bq_client = bigquery.Client(project=project)
+    location = os.environ["LOCATION"] 
+
     bq_client.insert_rows(
         table=bq_client.get_table(f"{bq_dataset}.{bq_table}"),
         rows=[
@@ -380,36 +348,3 @@ def write_to_bigquery(
             },
         ],
     )
-
-def delete_document(
-    event_id: str,
-    input_bucket: str,
-    filename: str,
-    project: str,
-    bq_dataset: str,
-    bq_table: str,
-) -> None:
-    """Delete a document summary from BigQuery when the source document is deleted.
-
-    Args:
-        event_id: The Eventarc trigger event ID.
-        input_bucket: Name of the input bucket.
-        filename: Name of the input file.
-        project: Google Cloud project ID.
-        bq_dataset: Name of the BigQuery dataset.
-        bq_table: Name of the BigQuery table.
-    """
-    doc_path = f"gs://{input_bucket}/{filename}"
-    print(f"🗑️ {event_id}: Removing document summary from BigQuery: {project}.{bq_dataset}.{bq_table}")
-
-    bq_client = bigquery.Client(project=project)
-    query = f"""
-    DELETE FROM `{project}.{bq_dataset}.{bq_table}`
-    WHERE 'document_path' = '{doc_path}'
-    """
-    print(f"query: {query}")
-
-    query_job = bq_client.query(query)
-    query_job.result()  # Wait for the query to complete
-
-    print(f"✅ {event_id}: Document summary removal attempt finished for {doc_path}.")

@@ -121,6 +121,7 @@ resource "google_project_iam_member" "webhook" {
     "roles/aiplatform.serviceAgent", # https://cloud.google.com/iam/docs/service-agents
     "roles/bigquery.dataEditor",     # https://cloud.google.com/bigquery/docs/access-control
     "roles/documentai.apiUser",      # https://cloud.google.com/document-ai/docs/access-control/iam-roles
+    "roles/aiplatform.user"
   ])
   role = each.key
 }
@@ -289,6 +290,14 @@ resource "google_cloud_tasks_queue" "task_queue" {
   name     = "doc-processing-queue"
   location = var.region
   project  = module.project_services.project_id
+
+  retry_config {
+    max_attempts       = 1              # Total attempts = initial + 4 retries
+    min_backoff        = "60s"          # Wait at least 10s between retries
+    max_backoff        = "600s"         # Wait at most 10 minutes between retries
+    max_doublings      = 1              # Controls exponential backoff growth
+    max_retry_duration = "3600s"        # Retry for up to 1 hour
+  }
 }
 
 # Create the processor function
